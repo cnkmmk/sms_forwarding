@@ -12,6 +12,7 @@
 #include <mbedtls/md.h>  // 用于钉钉签名的HMAC-SHA256
 #include <base64.h>      // Base64编码
 #include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
 
 //wifi信息，需要你打开这个去改
 #include "wifi_config.h"
@@ -114,6 +115,35 @@ struct ConcatSms {
 };
 
 ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];  // 长短信缓存
+
+// 保存企业微信的 TOKEN
+bool saveTokenToNVS(const String& token)
+{
+    preferences.begin("sms_config", false);
+    bool success = preferences.putString("auth_token", token);
+    preferences.end();    
+    if (success) {
+        Serial.println("Token saved to NVS successfully");
+    } else {
+        Serial.println("Failed to save token to NVS");
+    }    
+    return success;
+}
+
+// 读取企业微信的 TOKEN
+String readTokenFromNVS()
+{
+    preferences.begin("sms_config", true);
+    String token = preferences.getString("auth_token", "");  // 默认空字符串
+    preferences.end();    
+    if (token.length() > 0) {
+        Serial.println("Token read from NVS successfully");
+    } else {
+        Serial.println("No token found in NVS");
+    }    
+    return token;
+}
+
 
 // 保存配置到NVS
 void saveConfig() {
@@ -2227,89 +2257,109 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       break;
     }
 
-    case PUSH_TYPE_QIYEWEIXIN: {
-      // 企业微信应用推送
-      // channel.key1 是 corpID,agentID,corpSecret , channel.key2 是 toUser
-
-      String key1 = channel.key1; // 原始字符串
-      int firstComma = key1.indexOf(',');
-      int secondComma = key1.indexOf(',', firstComma + 1);
-      String corpID = "";
-      String agentID = "";
-      String corpSecret = "";
-      if (firstComma != -1 && secondComma != -1) {
-        corpID = key1.substring(0, firstComma);
-        agentID = key1.substring(firstComma + 1, secondComma);
-        corpSecret = key1.substring(secondComma + 1);
-      } else {
-          Serial.println("key1 格式错误，缺少逗号分隔符");
-      }
-      
-      // 构建获取 AccessToken 的 URL
-      String qywxBaseUrl = channel.url.length() > 0 ? channel.url : "https://qyapi.weixin.qq.com";
-      String tokenUrl = qywxBaseUrl + "/cgi-bin/gettoken?corpid=" + corpID + "&corpsecret=" + corpSecret;
-      String token = "";
-
-      // 最大重试次数（防止永久阻塞，可选）
-      const unsigned long MAX_RETRIES = 10;
-      const unsigned long RETRY_DELAY_MS = 2000; // 每次失败后等待 2 秒
-
-      for (unsigned long attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        //Serial.printf("[尝试 %lu/%lu] 请求 token: %s\n", attempt, MAX_RETRIES, tokenUrl.c_str());
-        http.setConnectTimeout(5000); // 5秒连接超时
-        http.setTimeout(10000);       // 10秒读取超时
-        http.begin(tokenUrl);
-
-        int httpCode = http.GET();
-        if (httpCode == HTTP_CODE_OK) {
-          String payload = http.getString();
-          //Serial.println("收到响应: " + payload);
-          DynamicJsonDocument doc(1024);
-          DeserializationError error = deserializeJson(doc, payload);
-          if (!error) {
-            int errcode = doc["errcode"] | -1;     // 默认 -1 表示解析失败
-            const char* errmsg = doc["errmsg"] | "unknown";
-            const char* access_token = doc["access_token"];
-            if (errcode == 0 && access_token != nullptr) {
-              token = String(access_token);
-              int expires_in = doc["expires_in"] | 7200;
-              // Serial.printf("✅ 获取 access_token 成功: %s (有效期 %d 秒)\n", token.c_str(), expires_in);
-              http.end();
-              break;
-            }
-          }
-        }
-        http.end();
-      }
-      //Serial.printf("✅ 获取 access_token 成功: %s \n", token.c_str());
-
-      if (not token.isEmpty()){
-        String url = qywxBaseUrl + "/cgi-bin/message/send?access_token=" + token;
-        String message = senderEscaped + "\n------------------------\n" + messageEscaped + "\n";
-
-        // 构建 JSON 数据
-        String payload = "{\"touser\": \"";
-          payload += channel.key2;
-          payload += "\", \"msgtype\": \"text\", \"agentid\": ";
-          payload += agentID;
-          payload += ", \"text\": {\"content\": \"";
-          payload += message;
-          payload += "\"}}";
-
-        //Serial.println("payload: " + payload);
-        http.begin(url);
-        http.addHeader("Content-Type", "application/json");
-        httpCode = http.POST(payload);
-      }
-      
-      break;
+case PUSH_TYPE_QIYEWEIXIN: {
+    // 企业微信应用推送
+    // channel.key1 是 corpID,agentID,corpSecret , channel.key2 是 toUser
+    
+    // 解析配置参数
+    String key1 = channel.key1;
+    int firstComma = key1.indexOf(',');
+    int secondComma = key1.indexOf(',', firstComma + 1);
+    
+    if (firstComma == -1 || secondComma == -1) {
+        Serial.println("企业微信配置格式错误，应为: corpID,agentID,corpSecret");
+        break;
     }
+    
+    String corpID = key1.substring(0, firstComma);
+    String agentID = key1.substring(firstComma + 1, secondComma);
+    String corpSecret = key1.substring(secondComma + 1);
+    
+    // 构建企业微信API基础URL
+    String qywxBaseUrl = channel.url.length() > 0 ? channel.url : "https://qyapi.weixin.qq.com";
+
+    // 读取 NVS 中的 token
+    String accessToken = readTokenFromNVS();
+    
+    String response = "";
+    bool tokenRefreshed = false;  // 标记是否已刷新token
+    int retryCount = 0;           // 重试计数
+    const int MAX_RETRY = 1;       // 最大重试次数（token刷新一次）
+
+    do {
+        // 构建发送消息的URL
+        String sendUrl = qywxBaseUrl + "/cgi-bin/message/send?access_token=" + accessToken;
+        
+        // 构建消息内容
+        String messageContent = senderEscaped + "\n------------------------\n" + messageEscaped + "\n";
+        
+        // 构建JSON负载
+        DynamicJsonDocument payloadDoc(512);
+        payloadDoc["touser"] = channel.key2;
+        payloadDoc["msgtype"] = "text";
+        payloadDoc["agentid"] = agentID.toInt();
+        payloadDoc["safe"] = 0;
+        
+        JsonObject textObj = payloadDoc.createNestedObject("text");
+        textObj["content"] = messageContent;
+        
+        String payload;
+        serializeJson(payloadDoc, payload);
+        
+        //Serial.println("企业微信消息: " + payload);
+        
+        // 发送 HTTPS 请求
+        WiFiClientSecure client;
+        client.setInsecure();
+        
+        HTTPClient http;
+        http.begin(client, sendUrl);
+        http.addHeader("Content-Type", "application/json");
+        
+        httpCode = http.POST(payload);
+
+        response = http.getString();
+        
+        // 解析响应获取 errcode
+        int errcode = -1;
+        if (response.length() > 0) {
+            DynamicJsonDocument doc(1024);
+            DeserializationError error = deserializeJson(doc, response);
+            
+            if (!error) {
+                errcode = doc["errcode"] | -1;
+            }
+        }
+
+        // Token 刷新逻辑
+        if (errcode == 42001 && !tokenRefreshed && retryCount < MAX_RETRY) {
+            String newToken = getQiyeWeixinToken(qywxBaseUrl, corpID, corpSecret);
+            
+            if (newToken.length() > 0) {
+                accessToken = newToken;  // 使用新 token
+                tokenRefreshed = true;
+                retryCount++;
+                http.end();  // 释放当前连接
+                continue;  // 重试发送
+            } else {
+                //Serial.println("Failed to refresh token");
+                break;
+            }
+        }
+        
+        // 如果不需要重试或者重试失败，退出循环
+        break;
+        
+    } while (true);
+
+    break;
+}
     
     default:
       Serial.println("未知推送类型");
       return;
   }
-  
+
   if (httpCode > 0) {
     Serial.printf("[%s] 响应码: %d\n", channelName.c_str(), httpCode);
     if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
@@ -2320,6 +2370,62 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
     Serial.printf("[%s] HTTP请求失败: %s\n", channelName.c_str(), http.errorToString(httpCode).c_str());
   }
   http.end();
+}
+
+// 获取企业微信访问令牌
+String getQiyeWeixinToken(const String& baseUrl, const String& corpID, const String& corpSecret) {
+  String tokenUrl = baseUrl + "/cgi-bin/gettoken?corpid=" + corpID + "&corpsecret=" + corpSecret;
+  
+  const unsigned long MAX_RETRIES = 3;  // 减少重试次数，避免阻塞太久
+  const unsigned long RETRY_DELAY_MS = 1000;
+  
+  for (unsigned long attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    Serial.printf("企业微信获取token尝试 %lu/%lu\n", attempt, MAX_RETRIES);
+    
+    HTTPClient http;
+    http.setConnectTimeout(8000);  // 8秒连接超时
+    http.setTimeout(15000);        // 15秒读取超时
+    http.begin(tokenUrl);
+    
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      String response = http.getString();
+      DynamicJsonDocument doc(512);
+      DeserializationError error = deserializeJson(doc, response);
+      
+      if (!error) {
+        int errcode = doc["errcode"] | -1;
+        if (errcode == 0) {
+          const char* access_token = doc["access_token"];
+          if (access_token != nullptr) {
+            String token = String(access_token);
+            Serial.println("企业微信token获取成功");
+            http.end();
+
+            saveTokenToNVS(token);
+            
+            return token;
+          }
+        } else {
+          const char* errmsg = doc["errmsg"] | "unknown error";
+          Serial.printf("企业微信API错误: %s (%d)\n", errmsg, errcode);
+        }
+      } else {
+        Serial.println("企业微信响应JSON解析失败");
+      }
+    } else {
+      Serial.printf("企业微信token请求失败: %s (HTTP %d)\n", http.errorToString(httpCode).c_str(), httpCode);
+    }
+    
+    http.end();
+    
+    // 重试前等待
+    if (attempt < MAX_RETRIES) {
+      delay(RETRY_DELAY_MS);
+    }
+  }
+  
+  return "";  // 返回空字符串表示失败
 }
 
 // 发送短信到所有启用的推送通道
