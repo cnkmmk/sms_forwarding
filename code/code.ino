@@ -12,7 +12,7 @@
 #include <mbedtls/md.h>  // 用于钉钉签名的HMAC-SHA256
 #include <base64.h>      // Base64编码
 #include <ArduinoJson.h>
-#include <WiFiClientSecure.h>
+#include <lwip/dns.h>
 
 //wifi信息，需要你打开这个去改
 #include "wifi_config.h"
@@ -122,11 +122,6 @@ bool saveTokenToNVS(const String& token)
     preferences.begin("sms_config", false);
     bool success = preferences.putString("auth_token", token);
     preferences.end();    
-    if (success) {
-        Serial.println("Token saved to NVS successfully");
-    } else {
-        Serial.println("Failed to save token to NVS");
-    }    
     return success;
 }
 
@@ -136,11 +131,6 @@ String readTokenFromNVS()
     preferences.begin("sms_config", true);
     String token = preferences.getString("auth_token", "");  // 默认空字符串
     preferences.end();    
-    if (token.length() > 0) {
-        Serial.println("Token read from NVS successfully");
-    } else {
-        Serial.println("No token found in NVS");
-    }    
     return token;
 }
 
@@ -2306,8 +2296,6 @@ case PUSH_TYPE_QIYEWEIXIN: {
         String payload;
         serializeJson(payloadDoc, payload);
         
-        //Serial.println("企业微信消息: " + payload);
-        
         // 发送 HTTPS 请求
         WiFiClientSecure client;
         client.setInsecure();
@@ -2519,6 +2507,8 @@ void processSmsContent(const char* sender, const char* text, const char* timesta
   // 发送通知邮件
   String subject = ""; subject+="短信：";subject+=sender;
   String body = ""; body+="时间戳：";body+=timestamp;body+="<br>\r\n发送者：";body+=sender;body+="<br>\r\n内容：";body+=text;
+
+  // 发送短信到邮件
   sendEmailNotification(subject.c_str(), body.c_str());
 }
 
@@ -2737,7 +2727,11 @@ void setup() {
   }
   Serial.println("网络已注册");
   // ========== 模组初始化完成 ==========
-  
+
+  // 连接WiFi（支持隐藏SSID）
+  WiFi.disconnect(true); // 断开任何现有的连接
+  delay(100);
+
   // 连接WiFi（支持隐藏SSID）
   // 参数: ssid, password, channel(0=自动), bssid(nullptr=自动), connect(true=连接隐藏网络)
   WiFi.begin(WIFI_SSID, WIFI_PASS, 0, nullptr, true);
@@ -2747,10 +2741,31 @@ void setup() {
   Serial.println("wifi已连接");
   Serial.print("IP地址: ");
   Serial.println(WiFi.localIP());
+
+    // 设置自定义 DNS 服务器
+  IPAddress dns1(223, 5, 5, 5);   // 主 DNS（Google DNS）
+  IPAddress dns2(180, 76, 76, 76);   // 备用 DNS（Google DNS）
+
+    // 将 IPAddress 转换为 ip_addr_t
+  ip_addr_t dns_ip1, dns_ip2;
+  dns_ip1.type = IPADDR_TYPE_V4;
+  dns_ip1.u_addr.ip4.addr = dns1; // 将 IPAddress 赋值给 ip_addr_t
+
+  dns_ip2.type = IPADDR_TYPE_V4;
+  dns_ip2.u_addr.ip4.addr = dns2; // 将 IPAddress 赋值给 ip_addr_t
+
+  // 使用 lwip 的 dns_setserver() 设置 DNS
+  dns_setserver(0, &dns_ip1);      // 设置主 DNS
+  dns_setserver(1, &dns_ip2);      // 设置备用 DNS
+
+  Serial.println("DNS设置为:223.5.5.5");
+
+  // 禁用Wi-Fi省电模式
+  WiFi.setSleep(false);
   
   // NTP时间同步（获取UTC时间）
   Serial.println("正在同步NTP时间...");
-  configTime(0, 0, "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
+  configTime(0, 0, "0.cn.pool.ntp.org", "1.cn.pool.ntp.org", "2.cn.pool.ntp.org");
   int ntpRetry = 0;
   while (time(nullptr) < 100000 && ntpRetry < 100) {
     delay(100);
